@@ -135,6 +135,7 @@ void naive_chroma_420(double *in_cbcr, double *out_cb_f, double *out_cr_f, int w
 }
 
 void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f) {
+    
     asm volatile ("fence rw, rw" : : : "memory");
     snrt_cluster_hw_barrier();
 
@@ -142,61 +143,51 @@ void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f) 
     double *p_zero = &zero_val;
     uintptr_t base_addr = (uintptr_t)in_cbcr;
 
-    // PASS 1: Cb
-    void *p_cb_top = (void*)(base_addr + 0);
-    void *p_cb_bot = (void*)(base_addr + 64);
+    // --- SINGLE PASS CONFIGURATION ---
+    void *p_top = (void*)(base_addr + 0);
+    void *p_bot = (void*)(base_addr + 64);
 
-    snrt_ssr_loop_2d(SNRT_SSR_DM0, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_cb_top);
-    snrt_ssr_loop_2d(SNRT_SSR_DM1, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_cb_bot);
+    // b0=8 (όλη η γραμμή), s0=8 (συνεχόμενα chunks)
+    // b1=8 (8 ζεύγη γραμμών), s1=128 (πήδημα στη μεθεπόμενη γραμμή!)
+    snrt_ssr_loop_2d(SNRT_SSR_DM0, 8, 8, 8, 128); 
+    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_top);
+    snrt_ssr_loop_2d(SNRT_SSR_DM1, 8, 8, 8, 128); 
+    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_bot);
 
     snrt_ssr_enable();
     asm volatile(
-        "fld f31, 0(%[zero]) \n"
-        "csrsi 0x801, 0x1 \n"
-        "li t1, 31 \n"
+        "fld      f31, 0(%[zero]) \n"
+        "csrsi    0x801, 0x1 \n"      
+        "li       t1, 31 \n"          // 32 iterations (4 ανά Row-Pair * 8 Pairs)
+
         "1: \n"
-        "fmv.d f8, f0 \n" "fmv.d f9, f1 \n"
-        "vfadd.h f10, f8, f9 \n"
-        "fmv.d f16, f31 \n"
-        "vfsum.h f16, f10 \n"
-        "fmv.x.w t0, f16 \n"
-        "sw t0, 0(%[out]) \n" 
-        "addi %[out], %[out], 4 \n"
-        "addi t1, t1, -1 \n"
-        "bgez t1, 1b \n"
-        "csrci 0x801, 0x1 \n"
-        : [out] "+r"(out_cb_f) : [zero] "r"(p_zero) : "f8","f9","f10","f16","f31","t0","t1","memory"
-    );
-    snrt_ssr_disable();
+        // --- Cb Block ---
+        "fmv.d    f8, f0 \n"          // Pop Top Cb (4 pixels)
+        "fmv.d    f9, f1 \n"          // Pop Bot Cb (4 pixels)
+        "vfadd.h  f10, f8, f9 \n"
+        "fmv.d    f16, f31 \n"
+        "vfsum.h  f16, f10 \n"        
+        "fmv.x.w  t0, f16 \n"         
+        "sw       t0, 0(%[out_cb]) \n"
+        "addi     %[out_cb], %[out_cb], 4 \n"
 
-    // PASS 2: Cr
-    void *p_cr_top = (void*)(base_addr + 8);
-    void *p_cr_bot = (void*)(base_addr + 72);
+        // --- Cr Block ---
+        "fmv.d    f8, f0 \n"          // Pop Top Cr (4 pixels)
+        "fmv.d    f9, f1 \n"          // Pop Bot Cr (4 pixels)
+        "vfadd.h  f10, f8, f9 \n"
+        "fmv.d    f16, f31 \n"
+        "vfsum.h  f16, f10 \n"        
+        "fmv.x.w  t0, f16 \n"         
+        "sw       t0, 0(%[out_cr]) \n"
+        "addi     %[out_cr], %[out_cr], 4 \n"
+        
+        "addi     t1, t1, -1 \n"
+        "bgez     t1, 1b \n"
 
-    snrt_ssr_loop_2d(SNRT_SSR_DM0, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_cr_top);
-    snrt_ssr_loop_2d(SNRT_SSR_DM1, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_cr_bot);
-
-    snrt_ssr_enable();
-    asm volatile(
-        "fld f31, 0(%[zero]) \n"
-        "csrsi 0x801, 0x1 \n"
-        "li t1, 31 \n"
-        "2: \n"
-        "fmv.d f8, f0 \n" "fmv.d f9, f1 \n"
-        "vfadd.h f10, f8, f9 \n"
-        "fmv.d f16, f31 \n"
-        "vfsum.h f16, f10 \n"
-        "fmv.x.w t0, f16 \n"
-        "sw t0, 0(%[out]) \n"
-        "addi %[out], %[out], 4 \n"
-        "addi t1, t1, -1 \n"
-        "bgez t1, 2b \n"
-        "csrci 0x801, 0x1 \n"
-        : [out] "+r"(out_cr_f) : [zero] "r"(p_zero) : "f8","f9","f10","f16","f31","t0","t1","memory"
+        "csrci    0x801, 0x1 \n"
+        : [out_cb] "+r"(out_cb_f), [out_cr] "+r"(out_cr_f)
+        : [zero] "r"(p_zero) 
+        : "f8","f9","f10","f16","f31","t0","t1","memory"
     );
     snrt_ssr_disable();
 }
