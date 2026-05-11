@@ -131,22 +131,21 @@ void opt_YCBCR_conversion(uint8_t *input_idx, float16_t *out_Y, float16_t *out_C
  * OPT Stage 2: Chroma Subsampling 4:2:0 (Perfectly Paced FIFO)
  * -------------------------------------------------------------------------- */
 // OPT Stage 2: Chroma Subsampling (The Ultimate Hardware-Aligned Fix)
+// OPT Stage 2: Chroma Subsampling (Perfectly Synced FIFO)
 void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f) {
     
-    // Η FPU τρέχει 64 φορές: (32 iterations για τα chunks του Cb + 32 για του Cr)
+    // Η FPU τρέχει 64 φορές (32 Cb + 32 Cr)
     int n_fpu = 63; 
     
-    // Ο ALU τρέχει 32 φορές. Κάθε φορά διαβάζει από το FIFO 2 pixels Cb ΚΑΙ 2 pixels Cr
+    // Ο ALU τρέχει 32 φορές (Κάθε iter κάνει 2 pops: Cb και Cr)
     int n_alu = 31; 
     
     double *p_in_top = in_cbcr;
-    double *p_in_bot = in_cbcr + 8; // Row 1 είναι 8 doubles (64 bytes) μετά
+    double *p_in_bot = in_cbcr + 8; // Row 1 είναι 64 bytes μετά
     double *p_cb = out_cb_f;
     double *p_cr = out_cr_f;
 
     // --- SSR CONFIGURATION ---
-    // b0=8 (Διαβάζει 8 chunks των 64-bit ανά σειρά: Cb,Cr,Cb,Cr...)
-    // b1=8 (8 ζεύγη γραμμών). s1=128 bytes (πηδάει 1 σειρά)
     snrt_ssr_loop_2d(SNRT_SSR_DM0, 8, 8, 8, 128); 
     snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_in_top);
     
@@ -155,44 +154,42 @@ void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f) 
 
     snrt_ssr_enable();
 
-    // Ασφαλής, αλεξίσφαιρος μηδενισμός του f31 από τη μνήμη (Αποφυγή NaN-boxing)
     double zero_val = 0.0;
     double *p_zero = &zero_val;
 
     asm volatile(
-        "fld       f31, 0(%[zero]) \n" // Load 0.0 into f31
-        "csrsi     0x801, 0x1 \n"      // Enable FIFO
-        "mv        t6, x0 \n"          // Init bridge
+        "fld       f31, 0(%[zero]) \n" // Ασφαλής φόρτωση του 0.0
+        
+        "csrsi     0x801, 0x1 \n"      // 1. Ενεργοποιούμε το FIFO
+        // [ΑΦΑΙΡΕΘΗΚΕ ΤΟ mv t6, x0 ΓΙΑΤΙ ΜΟΛΥΝΕ ΤΟ QUEUE]
 
         // FPU Loop: ΑΚΡΙΒΩΣ 6 ΕΝΤΟΛΕΣ
-        // Κάθε iteration τρώει 64-bits (4 pixels) και ξερνάει 32-bits (2 pixels)
         "frep.o    %[n_fpu], 6, 0, 0 \n"  
-        "fmv.d     f8,  f0 \n"        // 1. Pop 64-bits από Top Row
-        "fmv.d     f9,  f1 \n"        // 2. Pop 64-bits από Bottom Row
-        "vfadd.h   f10, f8,  f9 \n"   // 3. Vertical Sum
-        "fmv.d     f16, f31 \n"       // 4. Clean Accumulator (Με το καθαρό 0.0)
-        "vfsum.h   f16, f10 \n"       // 5. Horizontal Sum -> 2 valid pixels στα χαμηλά 32-bits!
-        "fmv.x.w   t6, f16 \n"        // 6. Push ΜΟΝΟ τα 32 καθαρά bits στο FIFO
+        "fmv.d     f8,  f0 \n"        // Pop Cb/Cr από Top
+        "fmv.d     f9,  f1 \n"        // Pop Cb/Cr από Bot
+        "vfadd.h   f10, f8,  f9 \n"   // Κάθετο Sum
+        "fmv.d     f16, f31 \n"       // Clean Accumulator
+        "vfsum.h   f16, f10 \n"       // Οριζόντιο Sum
+        "fmv.x.w   t6, f16 \n"        // Push τα 32 καθαρά bits (2 pixels)
 
-        // ALU Loop: Επεξεργάζεται τα πακέτα των 32-bit (που έρχονται εναλλάξ Cb, Cr)
+        // ALU Loop: Απευθείας Stores για να σπάσουμε το Forwarding
         "1: \n"
-        "mv        t0, t6 \n"         // Pop 32-bits (2 pixels Cb)
-        "sw        t0, 0(%[cb]) \n"   // Store Cb στη μνήμη (Τα NaNs έμειναν στην FPU!)
-        "addi      %[cb], %[cb], 4 \n"// Advance pointer 4 bytes (2 * float16)
+        "sw        t6, 0(%[cb]) \n"   // Pop 1: Γράφει 2 Cb pixels ΑΠΕΥΘΕΙΑΣ από το t6
+        "addi      %[cb], %[cb], 4 \n"// Advance 4 bytes
         
-        "mv        t1, t6 \n"         // Pop 32-bits (2 pixels Cr)
-        "sw        t1, 0(%[cr]) \n"   // Store Cr στη μνήμη
-        "addi      %[cr], %[cr], 4 \n"// Advance pointer 4 bytes
+        "sw        t6, 0(%[cr]) \n"   // Pop 2: Γράφει 2 Cr pixels ΑΠΕΥΘΕΙΑΣ από το t6
+        "addi      %[cr], %[cr], 4 \n"// Advance 4 bytes
         
         "addi      %[alu_c], %[alu_c], -1 \n"
         "bgez      %[alu_c], 1b \n"
 
-        "csrci     0x801, 0x1 \n"     // Disable FIFO
+        "csrci     0x801, 0x1 \n"     // Απενεργοποιούμε το FIFO
         
         : [cb] "+r"(p_cb), [cr] "+r"(p_cr), [alu_c] "+r"(n_alu)
         : [n_fpu] "r"(n_fpu), [zero] "r"(p_zero)
-        : "f8", "f9", "f10", "f16", "f31", "t0", "t1", "t6", "memory"
+        : "f8", "f9", "f10", "f16", "f31", "t6", "memory"
     );
+    
     snrt_fpu_fence();
     snrt_ssr_disable();
 }
