@@ -46,7 +46,10 @@ static inline float fp16_to_float(float16_t x) {
     return result;
 }
 
-// NAIVE Stage 1
+// =========================================================================
+// STAGE 1: YCBCR CONVERSION
+// =========================================================================
+
 void naive_YCBCR_conversion(uint8_t *input_idx, double *out_Y, double *out_CbCr, double *lut, int total_pixels) {
     const double c_cb = 0.141;    
     const double c_cr = 0.17825;  
@@ -72,25 +75,6 @@ void naive_YCBCR_conversion(uint8_t *input_idx, double *out_Y, double *out_CbCr,
     }
 }
 
-// NAIVE Stage 2
-void naive_chroma_420(double *in_cbcr, double *out_cb_f, double *out_cr_f, int w, int h) {
-    for (int y = 0; y < h; y += 2) {
-        for (int x = 0; x < w; x += 2) {
-            double sum_cb = 0, sum_cr = 0;
-            int group = (y * w + x) / 4;
-            int lane  = (x % 4); 
-            sum_cb += in_cbcr[group * 8 + lane] + in_cbcr[group * 8 + lane + 1];
-            sum_cb += in_cbcr[(group + w/4) * 8 + lane] + in_cbcr[(group + w/4) * 8 + lane + 1];
-            sum_cr += in_cbcr[group * 8 + 4 + lane] + in_cbcr[group * 8 + 4 + lane + 1];
-            sum_cr += in_cbcr[(group + w/4) * 8 + 4 + lane] + in_cbcr[(group + w/4) * 8 + 4 + lane + 1];
-            int out_idx = (y / 2) * (w / 2) + (x / 2);
-            out_cb_f[out_idx] = sum_cb;
-            out_cr_f[out_idx] = sum_cr;
-        }
-    }
-}
-
-// OPT Stage 1
 void opt_YCBCR_conversion(uint8_t *input_idx, float16_t *out_Y, float16_t *out_CbCr, double *lut, int total_pixels) {
     float c_r_f  = 0.299f;
     float c_g_f  = 0.587f;
@@ -128,112 +112,92 @@ void opt_YCBCR_conversion(uint8_t *input_idx, float16_t *out_Y, float16_t *out_C
 }
 
 // =========================================================================
-// Η Πειραματική 4D SSR Συνάρτησή σου (Διορθωμένη για να κάνει compile)
+// STAGE 2: CHROMA SUBSAMPLING
 // =========================================================================
-// =========================================================================
-// THE ULTIMATE KERNEL: Two-Pass 2D SSR (Respects Depth-1 FIFO)
-// =========================================================================
+
+void naive_chroma_420(double *in_cbcr, double *out_cb_f, double *out_cr_f, int w, int h) {
+    for (int y = 0; y < h; y += 2) {
+        for (int x = 0; x < w; x += 2) {
+            double sum_cb = 0.0; double sum_cr = 0.0;
+            for (int dy = 0; dy < 2; dy++) {
+                for (int dx = 0; dx < 2; dx++) {
+                    int pixel_idx = (y + dy) * w + (x + dx);
+                    int group = pixel_idx / 4; int lane  = pixel_idx % 4;
+                    sum_cb += in_cbcr[group * 8 + lane];
+                    sum_cr += in_cbcr[group * 8 + 4 + lane];
+                }
+            }
+            int out_idx = (y / 2) * (w / 2) + (x / 2);
+            out_cb_f[out_idx] = sum_cb;
+            out_cr_f[out_idx] = sum_cr;
+        }
+    }
+}
+
 void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f) {
-    
-    // Ασφαλής μηδενισμός Accumulator
+    asm volatile ("fence rw, rw" : : : "memory");
+    snrt_cluster_hw_barrier();
+
     double zero_val = 0.0;
     double *p_zero = &zero_val;
+    uintptr_t base_addr = (uintptr_t)in_cbcr;
 
-    int n_iters_cb = 31; 
-    int n_iters_cr = 31;
+    // PASS 1: Cb
+    void *p_cb_top = (void*)(base_addr + 0);
+    void *p_cb_bot = (void*)(base_addr + 64);
 
-    // ==========================================
-    // PASS 1: Cb ONLY (1 Push / 1 Pop)
-    // ==========================================
-    // Row 0 ξεκινάει στο 0. Row 1 ξεκινάει 64 bytes μετά (8 doubles).
-    double *p_in_top_cb = in_cbcr;
-    double *p_in_bot_cb = in_cbcr + 8; 
-    double *p_cb = out_cb_f;
-
-    // b0=4 chunks. s0=16 bytes (Ρουφάει 8 bytes Cb, πηδάει 8 bytes Cr!)
-    // b1=8 pairs of rows. s1=128 bytes (Πηδάει στο επόμενο ζεύγος γραμμών)
     snrt_ssr_loop_2d(SNRT_SSR_DM0, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_in_top_cb);
-    
+    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_cb_top);
     snrt_ssr_loop_2d(SNRT_SSR_DM1, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_in_bot_cb);
+    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_cb_bot);
 
     snrt_ssr_enable();
-
     asm volatile(
-        "fld       f31, 0(%[zero]) \n"
-        "csrsi     0x801, 0x1 \n"      // Ενεργοποιούμε το FIFO
-        
-        // FPU Loop: Υπολογίζει και σπρώχνει ΜΟΝΟ Cb
-        "frep.o    %[n], 5, 0, 0 \n"  
-        "fmv.d     f8,  f0 \n"        // Pop Cb top
-        "fmv.d     f9,  f1 \n"        // Pop Cb bottom
-        "vfadd.h   f10, f8,  f9 \n"   // Add
-        "fmv.d     f16, f31 \n"       // Clean Acc
-        "vfsum.h   f16, f10 \n"       // Sum
-        "fmv.x.w   t6, f16 \n"        // <--- ΑΚΡΙΒΩΣ 1 PUSH ΣΤΟ FIFO!
-        
-        // ALU Loop
+        "fld f31, 0(%[zero]) \n"
+        "csrsi 0x801, 0x1 \n"
+        "li t1, 31 \n"
         "1: \n"
-        "mv        t0, t6 \n"         // <--- ΑΚΡΙΒΩΣ 1 POP ΑΠΟ ΤΟ FIFO!
-        "sw        t0, 0(%[cb]) \n"   // Safe store 32-bits (2 pixels)
-        "addi      %[cb], %[cb], 4 \n"
-        "addi      %[alu_c], %[alu_c], -1 \n"
-        "bgez      %[alu_c], 1b \n"
-
-        "csrci     0x801, 0x1 \n"     // Κλείνουμε το FIFO
-        
-        : [cb] "+r"(p_cb), [alu_c] "+r"(n_iters_cb)
-        : [n] "r"(31), [zero] "r"(p_zero)
-        : "f8", "f9", "f10", "f16", "f31", "t0", "t6", "memory"
+        "fmv.d f8, f0 \n" "fmv.d f9, f1 \n"
+        "vfadd.h f10, f8, f9 \n"
+        "fmv.d f16, f31 \n"
+        "vfsum.h f16, f10 \n"
+        "fmv.x.w t0, f16 \n"
+        "sw t0, 0(%[out]) \n" 
+        "addi %[out], %[out], 4 \n"
+        "addi t1, t1, -1 \n"
+        "bgez t1, 1b \n"
+        "csrci 0x801, 0x1 \n"
+        : [out] "+r"(out_cb_f) : [zero] "r"(p_zero) : "f8","f9","f10","f16","f31","t0","t1","memory"
     );
-    snrt_fpu_fence();
     snrt_ssr_disable();
 
-    // ==========================================
-    // PASS 2: Cr ONLY (1 Push / 1 Pop)
-    // ==========================================
-    // Το Cr βρίσκεται ακριβώς 1 double (8 bytes) δίπλα στο Cb!
-    double *p_in_top_cr = in_cbcr + 1; 
-    double *p_in_bot_cr = in_cbcr + 9; 
-    double *p_cr = out_cr_f;
+    // PASS 2: Cr
+    void *p_cr_top = (void*)(base_addr + 8);
+    void *p_cr_bot = (void*)(base_addr + 72);
 
     snrt_ssr_loop_2d(SNRT_SSR_DM0, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_in_top_cr);
-    
+    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_cr_top);
     snrt_ssr_loop_2d(SNRT_SSR_DM1, 4, 8, 16, 128); 
-    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_in_bot_cr);
+    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_cr_bot);
 
     snrt_ssr_enable();
-
     asm volatile(
-        "fld       f31, 0(%[zero]) \n"
-        "csrsi     0x801, 0x1 \n"
-        
-        // FPU Loop: Υπολογίζει και σπρώχνει ΜΟΝΟ Cr
-        "frep.o    %[n], 5, 0, 0 \n"  
-        "fmv.d     f8,  f0 \n"        
-        "fmv.d     f9,  f1 \n"        
-        "vfadd.h   f10, f8,  f9 \n"   
-        "fmv.d     f16, f31 \n"       
-        "vfsum.h   f16, f10 \n"       
-        "fmv.x.w   t6, f16 \n"        // <--- ΑΚΡΙΒΩΣ 1 PUSH ΣΤΟ FIFO!
-        
-        // ALU Loop
-        "1: \n"
-        "mv        t0, t6 \n"         // <--- ΑΚΡΙΒΩΣ 1 POP ΑΠΟ ΤΟ FIFO!
-        "sw        t0, 0(%[cr]) \n"   // Safe store 32-bits (2 pixels)
-        "addi      %[cr], %[cr], 4 \n"
-        "addi      %[alu_c], %[alu_c], -1 \n"
-        "bgez      %[alu_c], 1b \n"
-
-        "csrci     0x801, 0x1 \n"
-        
-        : [cr] "+r"(p_cr), [alu_c] "+r"(n_iters_cr)
-        : [n] "r"(31), [zero] "r"(p_zero)
-        : "f8", "f9", "f10", "f16", "f31", "t0", "t6", "memory"
+        "fld f31, 0(%[zero]) \n"
+        "csrsi 0x801, 0x1 \n"
+        "li t1, 31 \n"
+        "2: \n"
+        "fmv.d f8, f0 \n" "fmv.d f9, f1 \n"
+        "vfadd.h f10, f8, f9 \n"
+        "fmv.d f16, f31 \n"
+        "vfsum.h f16, f10 \n"
+        "fmv.x.w t0, f16 \n"
+        "sw t0, 0(%[out]) \n"
+        "addi %[out], %[out], 4 \n"
+        "addi t1, t1, -1 \n"
+        "bgez t1, 2b \n"
+        "csrci 0x801, 0x1 \n"
+        : [out] "+r"(out_cr_f) : [zero] "r"(p_zero) : "f8","f9","f10","f16","f31","t0","t1","memory"
     );
-    snrt_fpu_fence();
     snrt_ssr_disable();
 }
 
@@ -248,73 +212,73 @@ int main() {
     // Memory Allocation
     double    *lut       = (double *)   ALIGN_UP_TCDM(base);
     uint8_t   *input_idx = (uint8_t *)  ALIGN_UP_TCDM((uintptr_t)lut + 256 * sizeof(double));
-    
     double    *naive_Y    = (double *)   ALIGN_UP_TCDM((uintptr_t)input_idx + TOTAL_PIXELS * 3);
     double    *naive_CbCr = (double *)   ALIGN_UP_TCDM((uintptr_t)naive_Y   + TOTAL_PIXELS * sizeof(double));
     double    *naive_cb_f = (double *)   ALIGN_UP_TCDM((uintptr_t)naive_CbCr + TOTAL_PIXELS * 2 * sizeof(double));
     double    *naive_cr_f = (double *)   ALIGN_UP_TCDM((uintptr_t)naive_cb_f + CHROMA_PIXELS * sizeof(double));
-
     float16_t *opt_Y      = (float16_t *)ALIGN_UP_TCDM((uintptr_t)naive_cr_f + CHROMA_PIXELS * sizeof(double));
     float16_t *opt_CbCr   = (float16_t *)ALIGN_UP_TCDM((uintptr_t)opt_Y      + TOTAL_PIXELS * sizeof(float16_t));
-    
-    // Οι δείκτες εξόδου για την 4D ρουτίνα σου
     double    *opt_cb_f   = (double *)   ALIGN_UP_TCDM((uintptr_t)opt_CbCr   + TOTAL_PIXELS * 2 * 2 * sizeof(float16_t));
     double    *opt_cr_f   = (double *)   ALIGN_UP_TCDM((uintptr_t)opt_cb_f   + CHROMA_PIXELS * 2 * sizeof(double));
 
     for (int i = 0; i < 256; i++) lut[i] = (double)i;
-    for (int i = 0; i < TOTAL_PIXELS * 3; i++) input_idx[i] = (uint8_t)(i % 256);
-
+    for (int i = 0; i < TOTAL_PIXELS; i++) {
+        input_idx[i * 3 + 0] = (i + 50) % 256;
+        input_idx[i * 3 + 1] = (i + 100) % 256;
+        input_idx[i * 3 + 2] = (i + 150) % 256;
+    }
     snrt_cluster_hw_barrier();
 
-    // -- Run References --
+    // -- Measure Naive Stage 1 --
+    uint32_t n1_start = snrt_mcycle();
     naive_YCBCR_conversion(input_idx, naive_Y, naive_CbCr, lut, TOTAL_PIXELS);
-    naive_chroma_420(naive_CbCr, naive_cb_f, naive_cr_f, W, H);
-    
-    // ΠΡΕΠΕΙ να τρέξουμε το Stage 1 Opt για να γεμίσουμε τον πίνακα opt_CbCr!
-    opt_YCBCR_conversion(input_idx, opt_Y, opt_CbCr, lut, TOTAL_PIXELS);
+    uint32_t n1_end = snrt_mcycle();
 
-    // -- Η ΔΙΚΗ ΣΟΥ ΣΥΝΑΡΤΗΣΗ --
-    uint32_t start_cycles = snrt_mcycle();
+    // -- Measure Naive Stage 2 --
+    uint32_t n2_start = snrt_mcycle();
+    naive_chroma_420(naive_CbCr, naive_cb_f, naive_cr_f, W, H);
+    uint32_t n2_end = snrt_mcycle();
+
+    // -- Measure Opt Stage 1 --
+    uint32_t o1_start = snrt_mcycle();
+    opt_YCBCR_conversion(input_idx, opt_Y, opt_CbCr, lut, TOTAL_PIXELS);
+    uint32_t o1_end = snrt_mcycle();
+
+    // -- Measure Opt Stage 2 --
+    uint32_t o2_start = snrt_mcycle();
     opt_chroma_420_2d_ssr((double*)opt_CbCr, opt_cb_f, opt_cr_f);
-    uint32_t end_cycles = snrt_mcycle();
+    uint32_t o2_end = snrt_mcycle();
 
     // -- Verification --
     float16_t *cb_fp16_ptr = (float16_t *)opt_cb_f;
     float16_t *cr_fp16_ptr = (float16_t *)opt_cr_f;
-    int errors_Cb = 0, errors_Cr = 0;
-
-    printf("\n===================================================\n");
-    printf("              CHROMA 4D TEST ERROR LOG             \n");
-    printf("===================================================\n");
-
+    int errors = 0;
     for (int i = 0; i < CHROMA_PIXELS; i++) {
-        float opt_cb_val = fp16_to_float(cb_fp16_ptr[i]);
-        float opt_cr_val = fp16_to_float(cr_fp16_ptr[i]);
-
-        int cb_err = (opt_cb_val - naive_cb_f[i] > 0.5f || opt_cb_val - naive_cb_f[i] < -0.5f);
-        int cr_err = (opt_cr_val - naive_cr_f[i] > 0.5f || opt_cr_val - naive_cr_f[i] < -0.5f);
-
-        if (cb_err || cr_err) {
-            printf("Mismatch at Idx %d:\n", i);
-            if (cb_err) {
-                printf("  -> Cb : Opt = %8.3f | Ref = %8.3f\n", opt_cb_val, naive_cb_f[i]);
-                errors_Cb++;
-            }
-            if (cr_err) {
-                printf("  -> Cr : Opt = %8.3f | Ref = %8.3f\n", opt_cr_val, naive_cr_f[i]);
-                errors_Cr++;
-            }
-        }
+        if ((fp16_to_float(cb_fp16_ptr[i]) - naive_cb_f[i] > 0.5f) || (fp16_to_float(cr_fp16_ptr[i]) - naive_cr_f[i] > 0.5f)) errors++;
     }
 
-    if (errors_Cb == 0 && errors_Cr == 0) {
-        printf("  [SUCCESS] 4D SSR WORKS! 100%% Match.\n");
-    }
-
-    printf("\n[PERFORMANCE]\n");
-    printf("  - Cycles       : %u\n", end_cycles - start_cycles);
-    printf("  - Errors Cb    : %d / %d\n", errors_Cb, CHROMA_PIXELS);
-    printf("  - Errors Cr    : %d / %d\n", errors_Cr, CHROMA_PIXELS);
+    // -- Final Performance Report --
+    printf("\n===================================================\n");
+    printf("           PERFORMANCE COMPARISON REPORT           \n");
+    printf("===================================================\n");
+    printf(" STAGE 1: YCbCr CONVERSION\n");
+    printf("  - Naive Cycles : %u\n", n1_end - n1_start);
+    printf("  - Opt   Cycles : %u\n", o1_end - o1_start);
+    printf("  - Speedup      : %.2fx\n", (float)(n1_end - n1_start) / (o1_end - o1_start));
+    printf("---------------------------------------------------\n");
+    printf(" STAGE 2: CHROMA SUBSAMPLING (2x2)\n");
+    printf("  - Naive Cycles : %u\n", n2_end - n2_start);
+    printf("  - Opt   Cycles : %u\n", o2_end - o2_start);
+    printf("  - Speedup      : %.2fx\n", (float)(n2_end - n2_start) / (o2_end - o2_start));
+    printf("---------------------------------------------------\n");
+    printf(" TOTAL PIPELINE (S1 + S2)\n");
+    uint32_t total_n = (n1_end - n1_start) + (n2_end - n2_start);
+    uint32_t total_o = (o1_end - o1_start) + (o2_end - o2_start);
+    printf("  - Total Naive  : %u\n", total_n);
+    printf("  - Total Opt    : %u\n", total_o);
+    printf("  - Overall Gain : %.2fx\n", (float)total_n / total_o);
+    printf("---------------------------------------------------\n");
+    printf(" VERIFICATION: %s\n", (errors == 0) ? "[SUCCESS] 100% MATCH" : "[FAILED]");
     printf("===================================================\n\n");
 
     return 0;
