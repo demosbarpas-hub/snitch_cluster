@@ -18,7 +18,7 @@
 class IpcIface {
    private:
     static const int IPC_BUF_SIZE = 4096;
-    static const int IPC_BUF_SIZE_STRB = IPC_BUF_SIZE / 8 + 1;
+    static const int IPC_BUF_SIZE_STRB = IPC_BUF_SIZE;
     static const int IPC_ERR_DOUBLE_ARG = 30;
     static const long IPC_POLL_PERIOD_NS = 100000L;
 
