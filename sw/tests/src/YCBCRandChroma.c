@@ -69,7 +69,7 @@ void naive_YCBCR_conversion(uint8_t *input_idx, double *out_Y, double *out_CbCr,
 
             int g = i / 4;
             int l = i % 4;
-            out_CbCr[g * 8 + l]     = Cb;
+            out_CbCr[g * 8 + l]      = Cb;
             out_CbCr[g * 8 + 4 + l] = Cr;
         }
     }
@@ -112,7 +112,7 @@ void opt_YCBCR_conversion(uint8_t *input_idx, float16_t *out_Y, float16_t *out_C
 }
 
 // =========================================================================
-// STAGE 2: CHROMA SUBSAMPLING
+// STAGE 2: CHROMA SUBSAMPLING (STALL-FREE INTERLEAVED PIPELINE)
 // =========================================================================
 
 void naive_chroma_420(double *in_cbcr, double *out_cb_f, double *out_cr_f, int w, int h) {
@@ -147,47 +147,75 @@ void opt_chroma_420_2d_ssr(double *in_cbcr, double *out_cb_f, double *out_cr_f) 
     void *p_top = (void*)(base_addr + 0);
     void *p_bot = (void*)(base_addr + 64);
 
-    // b0=8 (όλη η γραμμή), s0=8 (συνεχόμενα chunks)
-    // b1=8 (8 ζεύγη γραμμών), s1=128 (πήδημα στη μεθεπόμενη γραμμή!)
     snrt_ssr_loop_2d(SNRT_SSR_DM0, 8, 8, 8, 128); 
     snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, p_top);
     snrt_ssr_loop_2d(SNRT_SSR_DM1, 8, 8, 8, 128); 
     snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, p_bot);
 
     snrt_ssr_enable();
+    
+    // Ασφαλείς μεταβλητές C για να κάνει register allocation ο compiler
+    uint32_t alu_cb1, alu_cr1, alu_cb2, alu_cr2;
+    uint32_t iters = 15; // 16 επαναλήψεις
+
     asm volatile(
         "fld      f31, 0(%[zero]) \n"
         "csrsi    0x801, 0x1 \n"      
-        "li       t1, 31 \n"          // 32 iterations (4 ανά Row-Pair * 8 Pairs)
 
         "1: \n"
-        // --- Cb Block ---
-        "fmv.d    f8, f0 \n"          // Pop Top Cb (4 pixels)
-        "fmv.d    f9, f1 \n"          // Pop Bot Cb (4 pixels)
-        "vfadd.h  f10, f8, f9 \n"
-        "fmv.d    f16, f31 \n"
-        "vfsum.h  f16, f10 \n"        
-        "fmv.x.w  t0, f16 \n"         
-        "sw       t0, 0(%[out_cb]) \n"
-        "addi     %[out_cb], %[out_cb], 4 \n"
+        // --- 1. Fetch SSR Streams Back-to-Back (Pops 0-7) ---
+        "fmv.d    f4, f0 \n"  // Cb1 Top
+        "fmv.d    f5, f1 \n"  // Cb1 Bot
+        "fmv.d    f8, f0 \n"  // Cr1 Top
+        "fmv.d    f9, f1 \n"  // Cr1 Bot
+        "fmv.d    f12, f0 \n" // Cb2 Top
+        "fmv.d    f13, f1 \n" // Cb2 Bot
+        "fmv.d    f16, f0 \n" // Cr2 Top
+        "fmv.d    f17, f1 \n" // Cr2 Bot
 
-        // --- Cr Block ---
-        "fmv.d    f8, f0 \n"          // Pop Top Cr (4 pixels)
-        "fmv.d    f9, f1 \n"          // Pop Bot Cr (4 pixels)
-        "vfadd.h  f10, f8, f9 \n"
-        "fmv.d    f16, f31 \n"
-        "vfsum.h  f16, f10 \n"        
-        "fmv.x.w  t0, f16 \n"         
-        "sw       t0, 0(%[out_cr]) \n"
-        "addi     %[out_cr], %[out_cr], 4 \n"
+        // --- 2. Vector Additions (Παράλληλα) ---
+        "vfadd.h  f6,  f4,  f5 \n"
+        "vfadd.h  f10, f8,  f9 \n"
+        "vfadd.h  f14, f12, f13 \n"
+        "vfadd.h  f18, f16, f17 \n"
+
+        // --- 3. Καθαρισμός Accumulators (Απόκρυψη Latency του vfadd) ---
+        "fmv.d    f7,  f31 \n"
+        "fmv.d    f11, f31 \n"
+        "fmv.d    f15, f31 \n"
+        "fmv.d    f19, f31 \n"
+
+        // --- 4. Reduction (Παράλληλα Pairwise Sums) ---
+        "vfsum.h  f7,  f6 \n"
+        "vfsum.h  f11, f10 \n"
+        "vfsum.h  f15, f14 \n"
+        "vfsum.h  f19, f18 \n"
+
+        // --- 5. Μεταφορά στην ALU (COPIFT Interleaving) ---
+        "fmv.x.w  %[alu_cb1], f7 \n"
+        "fmv.x.w  %[alu_cr1], f11 \n"
+        "fmv.x.w  %[alu_cb2], f15 \n"
+        "fmv.x.w  %[alu_cr2], f19 \n"
+
+        // --- 6. Μέγιστο Memory Bandwidth (Συνεχόμενα Stores) ---
+        "sw       %[alu_cb1], 0(%[out_cb]) \n"
+        "sw       %[alu_cr1], 0(%[out_cr]) \n"
+        "sw       %[alu_cb2], 4(%[out_cb]) \n"
+        "sw       %[alu_cr2], 4(%[out_cr]) \n"
+
+        // --- 7. Ενημέρωση Δεικτών & Loop ---
+        "addi     %[out_cb], %[out_cb], 8 \n"
+        "addi     %[out_cr], %[out_cr], 8 \n"
         
-        "addi     t1, t1, -1 \n"
-        "bgez     t1, 1b \n"
+        "addi     %[iters], %[iters], -1 \n"
+        "bgez     %[iters], 1b \n"
 
         "csrci    0x801, 0x1 \n"
-        : [out_cb] "+r"(out_cb_f), [out_cr] "+r"(out_cr_f)
+        : [out_cb] "+r"(out_cb_f), [out_cr] "+r"(out_cr_f),
+          [alu_cb1] "=&r"(alu_cb1), [alu_cr1] "=&r"(alu_cr1), [alu_cb2] "=&r"(alu_cb2), [alu_cr2] "=&r"(alu_cr2),
+          [iters] "+r"(iters)
         : [zero] "r"(p_zero) 
-        : "f8","f9","f10","f16","f31","t0","t1","memory"
+        : "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f31", "memory"
     );
     snrt_ssr_disable();
 }
@@ -250,14 +278,14 @@ int main() {
 
     // -- Final Performance Report --
     printf("\n===================================================\n");
-    printf("           PERFORMANCE COMPARISON REPORT           \n");
+    printf("            PERFORMANCE COMPARISON REPORT            \n");
     printf("===================================================\n");
     printf(" STAGE 1: YCbCr CONVERSION\n");
     printf("  - Naive Cycles : %u\n", n1_end - n1_start);
     printf("  - Opt   Cycles : %u\n", o1_end - o1_start);
     printf("  - Speedup      : %.2fx\n", (float)(n1_end - n1_start) / (o1_end - o1_start));
     printf("---------------------------------------------------\n");
-    printf(" STAGE 2: CHROMA SUBSAMPLING (2x2)\n");
+    printf(" STAGE 2: CHROMA SUBSAMPLING (2x2 Interleaved Pipeline)\n");
     printf("  - Naive Cycles : %u\n", n2_end - n2_start);
     printf("  - Opt   Cycles : %u\n", o2_end - o2_start);
     printf("  - Speedup      : %.2fx\n", (float)(n2_end - n2_start) / (o2_end - o2_start));
