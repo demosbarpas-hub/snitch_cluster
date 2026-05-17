@@ -3,13 +3,20 @@
 #include <stdint.h>
 #include <math.h>
 
-/* --- Configuration --- */
-#define ROW_SIZE 256
-#define ALIGN_UP_TCDM(addr) ((((addr) + ROW_SIZE - 1) / ROW_SIZE) * ROW_SIZE)
+/* --- Macros & Configuration --- */
+#define BANK_SIZE 8
+#define NUM_BANKS 32
+#define ROW_SIZE (NUM_BANKS * BANK_SIZE)
+
+#define ALIGN_UP_TCDM(addr) \
+    ((((addr) + ROW_SIZE - 1) / ROW_SIZE) * ROW_SIZE)
+
+#define W 8
+#define H 8
+#define TOTAL_PIXELS (W * H)
 
 typedef uint16_t float16_t;
 
-// Helper conversions
 static inline float16_t float_to_fp16(float x) {
     union { float f; uint32_t u; } v;
     asm volatile("fcvt.h.s %0, %1" : "=f"(v.f) : "f"(x));
@@ -24,20 +31,7 @@ static inline float fp16_to_float(float16_t x) {
     return result;
 }
 
-/* --- Σταθεροί Πίνακες DCT (L2) --- */
-const double dct_m_l2[8][8] __attribute__((aligned(64))) = {
-    {0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553, 0.353553},
-    {0.490393, 0.415735, 0.277785, 0.097545, -0.097545, -0.277785, -0.415735, -0.490393},
-    {0.461940, 0.191342, -0.191342, -0.461940, -0.461940, -0.191342, 0.191342, 0.461940},
-    {0.415735, -0.097545, -0.490393, -0.277785, 0.277785, 0.490393, 0.097545, -0.415735},
-    {0.353553, -0.353553, -0.353553, 0.353553, 0.353553, -0.353553, -0.353553, 0.353553},
-    {0.277785, -0.490393, 0.097545, 0.415735, -0.415735, -0.097545, 0.490393, -0.277785},
-    {0.191342, -0.461940, 0.461940, -0.191342, -0.191342, 0.461940, -0.461940, 0.191342},
-    {0.097545, -0.277785, 0.415735, -0.490393, 0.490393, -0.415735, 0.277785, -0.097545}
-};
-
-// Κανονικός Πίνακας DCT-II (8x8)
-// Κανονικός Πίνακας DCT-II (8x8) - Row-Packed
+/* --- Σταθερός Πίνακας DCT (FP16) --- */
 const uint64_t dct_m[16] __attribute__((aligned(64))) = {
     0x35a835a835a835a8, 0x35a835a835a835a8, // Σειρά 0
     0x2e3f34e93aa73be2, 0xbbe2baa7b4e9ae3f, // Σειρά 1
@@ -49,209 +43,266 @@ const uint64_t dct_m[16] __attribute__((aligned(64))) = {
     0xbbe23b64baa72e3f, 0xae3f3aa7bb643be2  // Σειρά 7
 };
 
-// Transposed Πίνακας DCT (M^T)
-// Transposed Πίνακας DCT (M^T) - Row-Packed
-const uint64_t dct_mt[16] __attribute__((aligned(64))) = {
-    0x3aa73b643be235a8, 0x2e3f321634e935a8, // Σειρά 0
-    0xb24032163aa735a8, 0xbaa7b696bbe2b5a8, // Σειρά 1
-    0xbc53b21634e935a8, 0x3b6436963240b5a8, // Σειρά 2
-    0xb8e3baab2e3f35a8, 0xbbe2b2163aa735a8, // Σειρά 3
-    0x38e3baabae3f35a8, 0x3be2b216baa735a8, // Σειρά 4
-    0x3c53b216b4e935a8, 0xbb643696b240b5a8, // Σειρά 5
-    0x32403216baa735a8, 0x3aa7b6963be2b5a8, // Σειρά 6
-    0xbaa73b64bbe235a8, 0xae3f3216b4e935a8  // Σειρά 7
+/* --- Πίνακας DCT για το Pass 2 (Broadcasted: 4x FP16 ανά 64-bit word) --- */
+const uint64_t dct_m_bcast[64] __attribute__((aligned(64))) = {
+    0x35a835a835a835a8, 0x35a835a835a835a8, 0x35a835a835a835a8, 0x35a835a835a835a8,
+    0x35a835a835a835a8, 0x35a835a835a835a8, 0x35a835a835a835a8, 0x35a835a835a835a8,
+    0x3be23be23be23be2, 0x3aa73aa73aa73aa7, 0x34e934e934e934e9, 0x2e3f2e3f2e3f2e3f,
+    0xae3fae3fae3fae3f, 0xb4e9b4e9b4e9b4e9, 0xbaa7baa7baa7baa7, 0xbbe2bbe2bbe2bbe2,
+    0x3b643b643b643b64, 0x3216321632163216, 0xb216b216b216b216, 0xbaabbaabbaabbaab,
+    0xbaabbaabbaabbaab, 0xb216b216b216b216, 0x3216321632163216, 0x3b643b643b643b64,
+    0x3aa73aa73aa73aa7, 0xb240b240b240b240, 0xbc53bc53bc53bc53, 0xb8e3b8e3b8e3b8e3,
+    0x38e338e338e338e3, 0x3c533c533c533c53, 0x3240324032403240, 0xbaa7baa7baa7baa7,
+    0x35a835a835a835a8, 0xb5a8b5a8b5a8b5a8, 0xb5a8b5a8b5a8b5a8, 0x35a835a835a835a8,
+    0x35a835a835a835a8, 0xb5a8b5a8b5a8b5a8, 0xb5a8b5a8b5a8b5a8, 0x35a835a835a835a8,
+    0x34e934e934e934e9, 0xbbe2bbe2bbe2bbe2, 0x3240324032403240, 0x3aa73aa73aa73aa7,
+    0xbaa7baa7baa7baa7, 0xb240b240b240b240, 0x3be23be23be23be2, 0xb4e9b4e9b4e9b4e9,
+    0x3216321632163216, 0xb696b696b696b696, 0x3696369636963696, 0xb216b216b216b216,
+    0xb216b216b216b216, 0x3696369636963696, 0xb696b696b696b696, 0x3216321632163216,
+    0x2e3f2e3f2e3f2e3f, 0xbaa7baa7baa7baa7, 0x3b643b643b643b64, 0xbbe2bbe2bbe2bbe2,
+    0x3be23be23be23be2, 0xbb64bb64bb64bb64, 0x3aa73aa73aa73aa7, 0xae3fae3fae3fae3f
 };
+
 // ========================================================================
-// SIMD PACKED DCT (FP16) - TWO PASSES
+// STAGE 1: PASS 1 (ROWS)
 // ========================================================================
-void simd_dct_forward(float16_t *in, float16_t *out, float16_t *tmp, const float16_t *dct_m) {
-    float offset_f = -128.0f;
-    
-    // --- STAGE 0: Level Shift (in -> out) ---
-    snrt_ssr_loop_1d(SNRT_SSR_DM0, 16, 8); 
+void simd_dct_pass1(float16_t *in, float16_t *out, float16_t *tmp, const float16_t *dct_m_param) {
+    float16_t off16 = float_to_fp16(-128.0f);
+    uint64_t off_vec __attribute__((aligned(8))) =
+        ((uint64_t)off16 << 48) | ((uint64_t)off16 << 32) | ((uint64_t)off16 << 16) | off16;
+    snrt_ssr_loop_1d(SNRT_SSR_DM0, 16, 8);
     snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_1D, (void*)in);
     snrt_ssr_loop_1d(SNRT_SSR_DM1, 16, 8);
     snrt_ssr_write(SNRT_SSR_DM1, SNRT_SSR_1D, (void*)out);
     snrt_ssr_enable();
     asm volatile(
-    "fcvt.h.s f10, %0 \n"           // Μετατροπή του offset σε FP16 (Lane 0)
-    "frep.o %[n], 1, 0, 0 \n"         // Επανάληψη για 16 chunks (64 pixels)
-    "vfadd.r.h f1, f0, f10 \n"      // f1 = f0 (Vector) + f10 (Scalar Broadcast)
-    :: "f"(offset_f), [n]"r"(15) 
-    : "f1", "f0", "f10"
-	);
-    snrt_fpu_fence(); snrt_ssr_disable();
+        "fld     f10, 0(%0)     \n"
+        "frep.o  %[n], 1, 0, 0 \n"
+        "vfadd.h f1, f0, f10   \n"
+        :: "r"(&off_vec), [n]"r"(15)
+        : "f1", "f0", "f10", "memory"
+    );
+    snrt_fpu_fence();
+    snrt_ssr_disable();
 
-    // --- STAGE 1: Pass 1 - Rows (out -> tmp) ---
-    // DM0: Data (Rows)
-    snrt_ssr_loop_2d(SNRT_SSR_DM0, 2, 8, 8, 8, 0, 16); //8 φορές την κάθε γραμμή, μετά από κάτω
+    snrt_ssr_loop_3d(SNRT_SSR_DM0, 2, 8, 8, 8, 0, 16);
     snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_3D, (void*)out);
-    // DM1: Matrix (Rows).
-    snrt_ssr_loop_2d(SNRT_SSR_DM1, 16, 8, 8, 0);//2 τιμές της γραμμής, μετά από κάτω για όλες τις 16 τιμές, μετά ξανά από την αρχή
-    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, (void*)dct_m);//DCT_m ο μη αναστραμένος πίνακας
-    // DM2: Sequential Write to tmp
-    snrt_ssr_loop_2d(SNRT_SSR_DM2, 16,8);
-    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, (void*)tmp);
+    snrt_ssr_loop_2d(SNRT_SSR_DM1, 16, 8, 8, 0);
+    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, (void*)dct_m_param);
     
     snrt_ssr_enable();
-	asm volatile(
-		"frep.o %[t0], 27, 0, 0 \n"  
+    double zero_val = 0.0;
+    double *p_zero = &zero_val;
+    uint32_t alu_f0, alu_f1, alu_f2, alu_f3;
+    uint32_t alu_idx = 16;
 
-		"fsub.d f10,f10,f10 \n"
-		"fsub.d f11,f11,f11 \n"
-		"fsub.d f12,f12,f12 \n"
-		"fsub.d f13,f13,f13 \n"
-
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfsum.h f10,f10 \n"
-		"vfsum.h f10,f10 \n"
-		
-		"vfmac.h f11, f0, f1 \n"
-		"vfmac.h f11, f0, f1 \n"
-		"vfsum.h f11,f11 \n"
-		"vfsum.h f11,f11 \n"
-
-		"vfmac.h f12, f0, f1 \n"
-		"vfmac.h f12, f0, f1 \n"
-		"vfsum.h f12,f12 \n"
-		"vfsum.h f12,f12 \n"
-				
-		"vfmac.h f13, f0, f1 \n"
-		"vfmac.h f13, f0, f1 \n"
-		"vfsum.h f13,f13 \n"
-		"vfsum.h f13,f13 \n"
-
-			// 5. FPU PACKING PHASE
-		// Μετατροπή των FP16 scalars σε FP32 για να τα δεχτεί η μονάδα packing
-		"fcvt.s.h  f20, f10 \n"
-		"fcvt.s.h  f21, f11 \n"
-		"fcvt.s.h  f22, f12 \n"
-		"fcvt.s.h  f23, f13 \n"
-		
-			// Συσκευασία στον f24
-		"vfcpka.h.s f24, f20, f21 \n"          
-		"vfcpkb.h.s f24, f22, f23 \n"          
-
-		"fmv.d f2, f24 \n" 
-
-		:: [t0] "r"(15)
-		: "f10", "f11", "f12", "f13", "ft0", "ft1", 
-		"f20", "f21", "f22", "f23", "f24", "memory"
-	);
-
-    snrt_fpu_fence();
+    asm volatile(
+        "fld     f31, 0(%[zero]) \n"  
+        "csrsi   0x801, 0x1      \n"  
+        "1:                      \n"
+        "vfmul.h  f4,  f0, f1 \n" "vfmul.h  f5,  f0, f1 \n"  
+        "vfmul.h  f8,  f0, f1 \n" "vfmul.h  f9,  f0, f1 \n"  
+        "vfmul.h  f12, f0, f1 \n" "vfmul.h  f13, f0, f1 \n"  
+        "vfmul.h  f16, f0, f1 \n" "vfmul.h  f17, f0, f1 \n"  
+        "vfadd.h  f5,  f5,  f4 \n" "vfadd.h  f9,  f9,  f8 \n"  
+        "vfadd.h  f13, f13, f12 \n" "vfadd.h  f17, f17, f16 \n"  
+        "fmv.d    f4,  f31 \n"  "fmv.d    f8,  f31 \n"  
+        "fmv.d    f12, f31 \n"  "fmv.d    f16, f31 \n"
+        "vfsum.h  f4,  f5 \n" "vfsum.h  f8,  f9 \n"  
+        "vfsum.h  f12, f13 \n" "vfsum.h  f16, f17 \n"  
+        "fmv.d    f5,  f31 \n" "fmv.d    f9,  f31 \n"
+        "fmv.d    f13, f31 \n" "fmv.d    f17, f31 \n"
+        "vfsum.h  f5,  f4 \n" "vfsum.h  f9,  f8 \n"  
+        "vfsum.h  f13, f12 \n" "vfsum.h  f17, f16 \n"  
+        "fmv.x.w  %[alu_f0], f5 \n" "fmv.x.w  %[alu_f1], f9 \n"
+        "fmv.x.w  %[alu_f2], f13 \n" "fmv.x.w  %[alu_f3], f17 \n"
+        "sh       %[alu_f0], 0(%[tmp]) \n" "sh       %[alu_f1], 2(%[tmp]) \n"
+        "sh       %[alu_f2], 4(%[tmp]) \n" "sh       %[alu_f3], 6(%[tmp]) \n"
+        "addi     %[tmp], %[tmp], 8 \n"
+        "addi     %[alu_idx], %[alu_idx], -1 \n"
+        "bnez     %[alu_idx], 1b \n"
+        "csrci   0x801, 0x1 \n"  
+        : [tmp] "+r"(tmp), [alu_idx] "+r"(alu_idx), [alu_f0] "=&r"(alu_f0), [alu_f1] "=&r"(alu_f1), [alu_f2] "=&r"(alu_f2), [alu_f3] "=&r"(alu_f3)
+        : [zero] "r"(p_zero) : "f4","f5","f6","f7","f8","f9","f10","f11","f12","f13","f14","f15","f16","f17","f31","memory"
+    );
     snrt_ssr_disable();
+}
 
-    // --- STAGE 2: Pass 2 - Columns (tmp -> out) ---
-    // DM0: Matrix. Sequential rows.
-    snrt_ssr_loop_3d(SNRT_SSR_DM0, 2, 8, 8, 8, 0, 16);
-    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_3D, (void*)dct_m);
-    // DM1: Data from tmp. We access COLUMNS using stride 16 (8 pixels * 2 bytes).
-    // Loop 0: 2 chunks (8 pixels), Loop 1: 4 rows, Loop 2: 8 columns/freqs
-    snrt_ssr_loop_3d(SNRT_SSR_DM1, 8, 2,8, 16, 8,0); 
-    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_3D, (void*)tmp);
-    // DM2: Write back to out
+// ========================================================================
+// STAGE 2: PASS 2 (COLUMNS) - VECTOR REDUCTION TREE
+// ========================================================================
+void simd_dct_pass2(float16_t *in, float16_t *out, uint64_t *mat_bcast) {
+    // Η μαγεία του Hardware: Διαβάζει τα 64 στοιχεία του mat_bcast, 
+    // αλλά επαναλαμβάνει το ΚΑΘΕΝΑ 2 φορές αυτόματα (stride 0)! -> 128 reads
+    snrt_ssr_loop_2d(SNRT_SSR_DM0, 2, 64, 0, 8);
+    snrt_ssr_read(SNRT_SSR_DM0, SNRT_SSR_2D, mat_bcast);
+    
+    // DM1: Pass 1 Output (Επανάληψη των 16 λέξεων για 8 φορές)
+    snrt_ssr_loop_2d(SNRT_SSR_DM1, 16, 8, 8, 0); 
+    snrt_ssr_read(SNRT_SSR_DM1, SNRT_SSR_2D, in);
+    
+    // DM2: Pass 2 Output (16 λέξεις σειριακά)
     snrt_ssr_loop_1d(SNRT_SSR_DM2, 16, 8);
-    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, (void*)out);
+    snrt_ssr_write(SNRT_SSR_DM2, SNRT_SSR_1D, out);
 
     snrt_ssr_enable();
-	asm volatile(
-		"frep.o %[t0], 10, 0, 0 \n"  // 10 εντολές block
 
-		// 1. Reset Accumulator (f10)
-		"fsub.d f10,f10,f10 \n"
+    uint32_t iters = 8; // 8 γραμμές τελικού αποτελέσματος
+    asm volatile(
+        "1: \n"
+        // --- Vector Multiplications (Back-to-back Pops) ---
+        "vfmul.h f4, f0, f1 \n" "vfmul.h f5, f0, f1 \n" // k=0
+        "vfmul.h f6, f0, f1 \n" "vfmul.h f7, f0, f1 \n" // k=1
+        "vfmul.h f8, f0, f1 \n" "vfmul.h f9, f0, f1 \n" // k=2
+        "vfmul.h f10, f0, f1 \n" "vfmul.h f11, f0, f1 \n" // k=3
+        "vfmul.h f12, f0, f1 \n" "vfmul.h f13, f0, f1 \n" // k=4
+        "vfmul.h f14, f0, f1 \n" "vfmul.h f15, f0, f1 \n" // k=5
+        "vfmul.h f16, f0, f1 \n" "vfmul.h f17, f0, f1 \n" // k=6
+        "vfmul.h f18, f0, f1 \n" "vfmul.h f19, f0, f1 \n" // k=7
 
-		// 2. Vertical Dot Product (8 κύκλοι)
-		// f0: Matrix Coefficients (Broadcasted/Interleaved από DM0)
-		// f1: Column Chunks (4 pixels από 4 στήλες από DM1)
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
-		"vfmac.h f10, f0, f1 \n"
+        // --- Vector Additions Level 1 ---
+        "vfadd.h f4, f4, f6 \n"  "vfadd.h f5, f5, f7 \n"
+        "vfadd.h f8, f8, f10 \n" "vfadd.h f9, f9, f11 \n"
+        "vfadd.h f12, f12, f14 \n" "vfadd.h f13, f13, f15 \n"
+        "vfadd.h f16, f16, f18 \n" "vfadd.h f17, f17, f19 \n"
 
-		// 3. Store Results
-		// Μετά από 8 vfmac, τα lanes του f10 έχουν:
-		// Lane 0: Col 0 result, Lane 1: Col 1 result, κλπ.
-		"fmv.d f2, f10 \n" 
+        // --- Vector Additions Level 2 ---
+        "vfadd.h f4, f4, f8 \n"   "vfadd.h f5, f5, f9 \n"
+        "vfadd.h f12, f12, f16 \n" "vfadd.h f13, f13, f17 \n"
 
-		:: [t0] "r"(15) 
-		: "f10", "memory"
-	);
+        // --- Vector Additions Level 3 (Τελικό Άθροισμα) ---
+        "vfadd.h f4, f4, f12 \n" "vfadd.h f5, f5, f13 \n"
 
-    snrt_fpu_fence();
+        // --- Stream Out στον DM2 ---
+        "fmv.d f2, f4 \n" "fmv.d f2, f5 \n"
+
+        "addi %[iters], %[iters], -1 \n"
+        "bnez %[iters], 1b \n"
+        : [iters] "+r"(iters)
+        :
+        : "f4","f5","f6","f7","f8","f9","f10","f11","f12","f13","f14","f15","f16","f17","f18","f19","memory"
+    );
+
     snrt_ssr_disable();
 }
 
-// --- Naive DCT για Verification ---
-void naive_dct(double *in, double *out, const double dct_m[8][8]) {
-    double s[8][8], tmp[8][8];
-    for (int i = 0; i < 64; i++) ((double*)s)[i] = in[i] - 128.0;
-    for (int r = 0; r < 8; r++) {
-        for (int c = 0; c < 8; c++) {
-            double sum = 0;
-            for (int k = 0; k < 8; k++) sum += s[r][k] * dct_m[c][k];
-            tmp[r][c] = sum;
-        }
+// --- Naive Reference Functions ---
+void naive_dct_pass1(float16_t *in, double *out, const float16_t *dct_m_fp16) {
+    double s[8][8], tmp_mat[8][8];
+    for (int i = 0; i < TOTAL_PIXELS; i++) {
+        s[i / 8][i % 8] = (double)fp16_to_float(in[i]) - 128.0;
     }
     for (int r = 0; r < 8; r++) {
         for (int c = 0; c < 8; c++) {
             double sum = 0;
-            for (int k = 0; k < 8; k++) sum += dct_m[r][k] * tmp[k][c];
-            out[r * 8 + c] = sum;
+            for (int k = 0; k < 8; k++) {
+                double weight = (double)fp16_to_float(dct_m_fp16[c * 8 + k]);
+                sum += s[r][k] * weight;
+            }
+            tmp_mat[r][c] = sum;
         }
     }
+    for (int i = 0; i < 64; i++) out[i] = tmp_mat[i/8][i%8];
 }
 
+void naive_dct_pass2(double *pass1_out, double *final_out, const float16_t *dct_m_fp16) {
+    double tmp_mat[8][8];
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            double sum = 0;
+            for (int k = 0; k < 8; k++) {
+                double weight = (double)fp16_to_float(dct_m_fp16[r * 8 + k]);
+                sum += pass1_out[k * 8 + c] * weight;
+            }
+            tmp_mat[r][c] = sum;
+        }
+    }
+    for (int i = 0; i < 64; i++) final_out[i] = tmp_mat[i/8][i%8];
+}
+
+// =========================================================================
+// MAIN ROUTINE
+// =========================================================================
 int main() {
+    // EARLY EXIT ΓΙΑ CORES 1-7
+    if (snrt_is_compute_core() && snrt_cluster_core_idx() != 0) {
+        return 0;
+    }
+
     uint32_t core_id = snrt_cluster_core_idx();
     uintptr_t base = (uintptr_t)snrt_l1_next();
     
     // Memory allocation
-    double *dct_in    = (double *)ALIGN_UP_TCDM(base);
-    double *dct_out_n = (double *)ALIGN_UP_TCDM((uintptr_t)dct_in  + 64 * sizeof(double));
-    double *l1_matrix = (double *)ALIGN_UP_TCDM((uintptr_t)dct_out_n + 64 * sizeof(double));
+    double    *dct_in     = (double *)   ALIGN_UP_TCDM(base);
+    double    *naive_p1   = (double *)   ALIGN_UP_TCDM((uintptr_t)dct_in   + TOTAL_PIXELS * sizeof(double));
+    double    *naive_p2   = (double *)   ALIGN_UP_TCDM((uintptr_t)naive_p1 + TOTAL_PIXELS * sizeof(double));
+    float16_t *in_h       = (float16_t *)ALIGN_UP_TCDM((uintptr_t)naive_p2 + TOTAL_PIXELS * sizeof(double));
+    float16_t *out_p1_h   = (float16_t *)ALIGN_UP_TCDM((uintptr_t)in_h     + TOTAL_PIXELS * sizeof(float16_t));
+    float16_t *out_p2_h   = (float16_t *)ALIGN_UP_TCDM((uintptr_t)out_p1_h + TOTAL_PIXELS * sizeof(float16_t));
+    float16_t *tmp_h      = (float16_t *)ALIGN_UP_TCDM((uintptr_t)out_p2_h + TOTAL_PIXELS * sizeof(float16_t));
     
-    float16_t *in_h   = (float16_t *)ALIGN_UP_TCDM((uintptr_t)l1_matrix + 64 * sizeof(double));
-    float16_t *out_h  = (float16_t *)ALIGN_UP_TCDM((uintptr_t)in_h + 64 * sizeof(float16_t));
-    float16_t *tmp_h  = (float16_t *)ALIGN_UP_TCDM((uintptr_t)out_h + 64 * sizeof(float16_t));
-    float16_t *mat_h  = (float16_t *)ALIGN_UP_TCDM((uintptr_t)tmp_h + 64 * sizeof(float16_t));
+    float16_t *mat_h      = (float16_t *)ALIGN_UP_TCDM((uintptr_t)tmp_h    + TOTAL_PIXELS * sizeof(float16_t));
+    uint64_t  *mat_bcast  = (uint64_t *) ALIGN_UP_TCDM((uintptr_t)mat_h    + 16 * sizeof(uint64_t));
 
+    // Φόρτωση και των δύο πινάκων μέσω DMA!
     if (snrt_is_dm_core()) {
-        snrt_dma_start_1d(l1_matrix, (void*)dct_m_l2, 64 * sizeof(double));
+        snrt_dma_start_1d(mat_h, (void*)dct_m, 16 * sizeof(uint64_t)); 
+        snrt_dma_start_1d(mat_bcast, (void*)dct_m_bcast, 64 * sizeof(uint64_t));
         snrt_dma_wait_all();
     }
+    
     snrt_cluster_hw_barrier();
 
     if (snrt_is_compute_core() && core_id == 0) {
-        // Initialize data
-        for (int i = 0; i < 64; i++) {
+        // Αρχικοποίηση δεδομένων
+        for (int i = 0; i < TOTAL_PIXELS; i++) {
             dct_in[i] = (double)((i*13 + (i/8)*27) % 256);
             in_h[i] = float_to_fp16(dct_in[i]);
-            mat_h[i] = float_to_fp16(l1_matrix[i]);
         }
 
-        // Run Naive (Reference)
-        naive_dct(dct_in, dct_out_n, (const double(*)[8])l1_matrix);
+        // --- Naive Εκτέλεση ---
+        uint32_t start_naive = snrt_mcycle();
+        naive_dct_pass1(in_h, naive_p1, mat_h);
+        naive_dct_pass2(naive_p1, naive_p2, mat_h);
+        uint32_t end_naive = snrt_mcycle();
 
-        // Run SIMD (Optimized)
-        uint32_t start = snrt_mcycle();
-        simd_dct_forward(in_h, out_h, tmp_h, mat_h);
-        uint32_t end = snrt_mcycle();
+        // --- Optimized Εκτέλεση ---
+        uint32_t start_opt = snrt_mcycle();
+        simd_dct_pass1(in_h, out_p1_h, tmp_h, mat_h);
+        simd_dct_pass2(tmp_h, out_p2_h, mat_bcast);
+        uint32_t end_opt = snrt_mcycle();
 
-        printf("\nIndex | Naive Out  | SIMD Out (FP16 Result)\n");
-        printf("--------------------------------------------\n");
-        for (int i = 0; i < 10; i++) {
-            printf("%5d | %10.3f | %10.3f\n", i, dct_out_n[i], fp16_to_float(out_h[i]));
+        // --- Verification ---
+        int err_p1 = 0, err_p2 = 0;
+        for (int i = 0; i < TOTAL_PIXELS; i++) {
+            double diff_p1 = (double)fp16_to_float(tmp_h[i]) - naive_p1[i];
+            if (diff_p1 > 0.5 || diff_p1 < -0.5 || diff_p1 != diff_p1) err_p1++;
+            
+            double diff_p2 = (double)fp16_to_float(out_p2_h[i]) - naive_p2[i];
+            if (diff_p2 > 1.0 || diff_p2 < -1.0 || diff_p2 != diff_p2) err_p2++;
         }
 
-        printf("\nSIMD Cycles: %u\n", end - start);
+        printf("\n===================================================\n");
+        printf("             PERFORMANCE COMPARISON REPORT            \n");
+        printf("===================================================\n");
+        printf(" 2D DCT FULL PIPELINE (Pass 1 + Pass 2)\n");
+        printf("  - Naive Cycles : %u\n", end_naive - start_naive);
+        printf("  - Opt   Cycles : %u\n", end_opt   - start_opt);
+        printf("  - Speedup      : %.2fx\n", (float)(end_naive - start_naive) / (end_opt - start_opt));
+        printf("---------------------------------------------------\n");
+        printf(" VERIFICATION PASS 1: %s\n", (err_p1 == 0) ? "[SUCCESS] 100% MATCH" : "[FAILED]");
+        printf(" VERIFICATION PASS 2: %s\n", (err_p2 == 0) ? "[SUCCESS] 100% MATCH" : "[FAILED]");
+        if (err_p1 || err_p2) printf(" Errors -> P1: %d, P2: %d\n", err_p1, err_p2);
+        printf("===================================================\n\n");
+
+        printf("--- First 8 Final Output Values (Pass 2 - Row 0) ---\n");
+        printf(" Index | Naive (double) | Opt (FP16 Packed)  \n");
+        printf("---------------------------------------\n");
+        for (int i = 0; i < 8; i++) {
+            printf(" %5d | %14.3f | %12.3f\n", i, naive_p2[i], fp16_to_float(out_p2_h[i]));
+        }
+        printf("---------------------------------------\n\n");
     }
 
-    snrt_cluster_hw_barrier();
     return 0;
 }
